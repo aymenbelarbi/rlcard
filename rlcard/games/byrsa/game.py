@@ -67,7 +67,15 @@ class _Scripted:
         return tuple(x for x in c if x in obs.hand)
 
     def __getattr__(self, item):
-        return getattr(self._d, item)
+        # Same deepcopy/pickle recursion trap as the OpenSpiel wrapper: those
+        # protocols probe for dunders before __init__ has run, and a naive
+        # `getattr(self._d, item)` re-enters this method looking for `_d`.
+        if item.startswith("__") or item == "_d":
+            raise AttributeError(item)
+        try:
+            return getattr(self.__dict__["_d"], item)
+        except KeyError:
+            raise AttributeError(item) from None
 
 
 class ByrsaGame:
@@ -78,7 +86,7 @@ class ByrsaGame:
         self.num_players = num_players
         self.np_random = random.Random()
         self.leak = False
-        self.delegate = 'BeliefBot(0.5)'
+        self.delegate = 'BeliefBot:0.5'
         self.rounds = 6
         self.seed = None
         self.fixed_seed = None

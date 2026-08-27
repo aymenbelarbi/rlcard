@@ -14,7 +14,7 @@ from rlcard.games.byrsa import Game
 DEFAULT_GAME_CONFIG = {
     'game_num_players': 5,
     'game_leak': False,        # False = sealed emulation; True = sequential leak
-    'game_delegate': 'BeliefBot(0.5)',
+    'game_delegate': 'BeliefBot:0.5',
     'game_rounds': 6,
     'game_seed': None,      # pin the deal, so E-12 can compare harnesses
 }
