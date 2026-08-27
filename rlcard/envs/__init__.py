@@ -47,3 +47,18 @@ register(
     env_id='bridge',
     entry_point='rlcard.envs.bridge:BridgeEnv',
 )
+
+# BYRSA needs the byrsa_sim engine, which lives outside this repo (it is the
+# only place a BYRSA rule is implemented; this env merely wraps it).  RLCard
+# resolves entry points EAGERLY in EnvSpec.__init__, so an unguarded register()
+# here would import rlcard/envs/byrsa.py at package-import time and take the
+# whole of `import rlcard` down with it when the engine is absent -- blackjack,
+# doudizhu and every other game included.  Degrade to "byrsa is not registered"
+# instead; upstream behaviour is then bit-for-bit unchanged.
+try:
+    register(
+        env_id='byrsa',
+        entry_point='rlcard.envs.byrsa:ByrsaEnv',
+    )
+except ImportError:
+    pass
