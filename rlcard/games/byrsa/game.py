@@ -35,6 +35,11 @@ from byrsa_sim.config import Config
 
 PHASE_PLEDGE = 'pledge'
 PHASE_RESCUE = 'rescue'
+# RULING 12 (v3 1.4): the Envoy declaration is its own lap, ahead of the sealed
+# commit.  RLCard is sequential already, so this costs nothing structurally --
+# but it has to be walked in the SAME Sufet-clockwise order over the SAME
+# eligible seats as the native lap, or E-12 stops comparing like with like.
+PHASE_ENVOY = 'envoy'
 
 
 class _Scripted:
@@ -54,6 +59,18 @@ class _Scripted:
         self.seat, self.rng = seat, rng
         self._d.reset(seat, rng)
 
+    def clear_script(self):
+        '''Discard any scripted move the engine did not consume.
+
+        A2 §6 makes the Envoy *instead of* pledging, so ``rules.step_pledge``
+        never calls ``pledge()`` on a seat that declared -- and a script left
+        sitting here is then consumed by the NEXT caller, which is Step 5's
+        D01 Rebuild.  Caught by the G-W5 declaring arm at 6p, where both
+        wrappers agreed with each other and both differed from the engine.
+        '''
+        self._pledge = None
+        self._rescue = None
+
     def pledge(self, obs):
         if self._pledge is None:
             return self._d.pledge(obs)
@@ -65,6 +82,11 @@ class _Scripted:
             return self._d.rescue(obs)
         c, self._rescue = self._rescue, None
         return tuple(x for x in c if x in obs.hand)
+
+    # declare_envoy is deliberately NOT scripted.  Under ruling 12 the env
+    # takes the declaration as an action and writes it straight into the state,
+    # and ``step_pledge(prelude_done=True)`` never asks an agent; under the v2
+    # flag the sealed commit asks, and __getattr__ forwards to the delegate.
 
     def __getattr__(self, item):
         # Same deepcopy/pickle recursion trap as the OpenSpiel wrapper: those
@@ -104,7 +126,7 @@ class ByrsaGame:
         return self.num_players
 
     def get_num_actions(self):
-        return action_space.NUM_ACTIONS
+        return action_space.NUM_DISTINCT_ACTIONS
 
     def get_player_id(self):
         return self.current_player
@@ -138,6 +160,37 @@ class ByrsaGame:
 
     def _begin_round(self):
         rules.begin_round(self.state, self.agents)
+        self.running_total = 0
+        # Step 3's discussion window comes from the ENGINE, not from here --
+        # the Notable window and U7 Silver League both change a hand, and a
+        # seat that declares before its draw-2 decides on different
+        # information than one that declares after.
+        rules.pledge_window(self.state, self.agents)
+        self.pending = {}
+        # RULING 12's lap.  The order comes from the ENGINE -- one definition
+        # of who is offered the Envoy and in what order, shared by the native
+        # lap and both wrappers.  Seats that may not declare are absent rather
+        # than handed a forced pass, which is what the native guard does.
+        self.envoy_order = (
+            rules.envoy_declaration_order(self.state)
+            if self.state.config.envoy_declared_before_commit else [])
+        if self.envoy_order:
+            self.phase = PHASE_ENVOY
+            self.order = self.envoy_order
+            self.idx = 0
+        else:
+            self._open_pledge_lap()
+
+    def _open_pledge_lap(self):
+        '''The sealed commit's seat order, and the snapshot it is sealed on.
+
+        The snapshot is taken HERE and not in ``_begin_round`` because it must
+        follow the declaration lap: a pledge observation carries who has
+        already declared (``envoy_declared_this_round``), which is the whole
+        point of ruling 12.  Freezing it earlier would hide the declarations
+        from every seat and diverge from the native engine, which snapshots
+        inside ``step_pledge`` after the lap.
+        '''
         self.phase = PHASE_PLEDGE
         # A2 §3b makes the Rescue lap start with the Sufet; the Pledge is
         # simultaneous and has no order, so we use the same seat order for the
@@ -145,9 +198,7 @@ class ByrsaGame:
         self.order = [(self.state.sufet + i) % self.num_players
                       for i in range(self.num_players)]
         self.idx = 0
-        self.pending = {}
         self._frozen = byrsa_obs.public_snapshot(self.state)
-        self.running_total = 0
 
     @property
     def current_player(self):
@@ -157,6 +208,8 @@ class ByrsaGame:
 
     # -- observations ------------------------------------------------------
     def _obs(self, seat):
+        if self.phase == PHASE_ENVOY:
+            return byrsa_obs.build(self.state, seat, 'envoy_declare')
         if self.phase == PHASE_RESCUE:
             return byrsa_obs.build(self.state, seat, 'rescue',
                                    gap=max(0, self.state.cost - self.running_total))
@@ -172,8 +225,7 @@ class ByrsaGame:
             'obs': obs,
             'seat': player_id,
             'phase': self.phase,
-            'legal_actions': action_space.legal_actions(
-                obs, 'pledge' if self.phase == PHASE_PLEDGE else 'rescue'),
+            'legal_actions': action_space.legal_actions(obs, self.phase),
             'round': self.state.round,
             'pillars': tuple(self.state.pillars),
             'cost': self.state.cost,
@@ -184,7 +236,12 @@ class ByrsaGame:
     def step(self, action):
         seat = self.current_player
         obs = self._obs(seat)
-        if self.phase == PHASE_PLEDGE:
+        if self.phase == PHASE_ENVOY:
+            self._apply_envoy(seat, int(action))
+            self.idx += 1
+            if self.idx >= len(self.order):
+                self._open_pledge_lap()
+        elif self.phase == PHASE_PLEDGE:
             cards = action_space.decode_pledge(obs, int(action))
             self.pending[seat] = cards
             if self.leak:
@@ -221,7 +278,9 @@ class ByrsaGame:
                     st.hands[seat].append(c)
         for seat, cards in self.pending.items():
             self.agents[seat]._pledge = cards
-        self.running_total = rules.step_pledge(st, self.agents)
+        self.running_total = rules.step_pledge(st, self.agents, prelude_done=True)
+        for a in self.agents:
+            a.clear_script()
         if self.running_total >= st.cost:
             self._finish_round()
             return
@@ -230,9 +289,20 @@ class ByrsaGame:
                       for i in range(self.num_players)]
         self.idx = 0
 
+    def _apply_envoy(self, seat, action):
+        '''One seat's declaration, written into the state IMMEDIATELY so the
+        next seat's observation carries it -- that visibility is the whole
+        point of ruling 12.'''
+        declared = (action == action_space.DECLARE_ENVOY)
+        assert not declared or rules.may_declare_envoy(self.state, seat), (
+            'DECLARE_ENVOY offered to a seat that may not declare')
+        self.state.envoy_declared[seat] = declared
+
     def _apply_rescue(self, seat, action, obs):
         self.agents[seat]._rescue = action_space.decode_rescue(obs, action)
-        return rules.rescue_one(self.state, self.agents, seat, self.running_total)
+        out = rules.rescue_one(self.state, self.agents, seat, self.running_total)
+        self.agents[seat].clear_script()
+        return out
 
     def _finish_round(self):
         st, ag = self.state, self.agents
